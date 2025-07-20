@@ -1,0 +1,431 @@
+#include <Servo.h>
+#include <LiquidCrystal_I2C.h>
+#include <Keypad.h>
+
+#ifndef PASSWORD_H
+#define PASSWORD_H
+
+#define MAX_PASSWORD_LENGTH (20)
+#define STRING_TERMINATOR '\0'
+
+int wrongAttemptCount = 0;
+bool isLockedOut = false;
+unsigned long lockoutStartTime = 0;
+const unsigned long lockoutDuration = 30000;
+
+class Password {
+public:
+    Password(char* pass);
+    void set(char* pass);
+    bool is(char* pass);
+    bool append(char character);
+    void reset();
+    bool evaluate();
+    Password &operator=(char* pass);
+    bool operator==(char* pass);
+    bool operator!=(char* pass);
+    Password &operator<<(char character);
+
+private:
+    char* target;
+    char guess[MAX_PASSWORD_LENGTH];
+    byte currentIndex;
+};
+
+#endif
+
+Password::Password(char* pass) {
+  set(pass);
+  reset();
+}
+
+void Password::set(char* pass) { target = pass; }
+
+bool Password::is(char* pass) {
+  byte i = 0;
+  while (*pass && i < MAX_PASSWORD_LENGTH) {
+    guess[i] = pass[i];
+    i++;
+  }
+  return evaluate();
+}
+
+bool Password::append(char character) {
+  if (currentIndex + 1 == MAX_PASSWORD_LENGTH) {
+    return false;
+  } else {
+    guess[currentIndex++] = character;
+    guess[currentIndex] = STRING_TERMINATOR;
+  }
+  return true;
+}
+
+void Password::reset() {
+  currentIndex = 0;
+  guess[currentIndex] = STRING_TERMINATOR;
+}
+
+bool Password::evaluate() {
+  char pass = target[0];
+  char guessed = guess[0];
+  for (byte i = 1; i < MAX_PASSWORD_LENGTH; ++i) {
+    if ((STRING_TERMINATOR == pass) && (STRING_TERMINATOR == guessed)) {
+      return true;
+    } else if ((pass != guessed) || (STRING_TERMINATOR == pass) ||
+               (STRING_TERMINATOR == guessed)) {
+      return false;
+    }
+    pass = target[i];
+    guessed = guess[i];
+  }
+  return false;
+}
+
+Password& Password::operator=(char* pass) {
+  set(pass);
+  return *this;
+}
+
+bool Password::operator==(char* pass) { return is(pass); }
+
+bool Password::operator!=(char* pass) { return !is(pass); }
+
+Password& Password::operator<<(char character) {
+  append(character);
+  return *this;
+}
+
+#define buzzer 11
+
+Servo servo;
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+char defaultPassword[] = "0123";
+char currentPassword[20];
+Password password = Password(defaultPassword);
+
+byte maxPasswordLength = 6;
+byte currentPasswordLength = 0;
+
+const byte ROWS = 4;
+const byte COLS = 4;
+
+char keys[ROWS][COLS] = {
+  {'D', 'C', 'B', 'A'},
+  {'#', '9', '6', '3'},
+  {'0', '8', '5', '2'},
+  {'*', '7', '4', '1'},
+};
+
+byte rowPins[ROWS] = {2, 3, 4, 5};
+byte colPins[COLS] = {6, 7, 8, 9};
+
+Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
+
+enum SystemState { NORMAL, CHANGE_PASSWORD, VERIFY_OLD, ENTER_NEW, CONFIRM_NEW };
+SystemState systemState = NORMAL;
+
+char newPassword[20];
+char confirmPassword[20];
+byte passwordEntryPosition = 0;
+
+void setup() {
+  Serial.begin(9600);
+  pinMode(buzzer, OUTPUT);
+  servo.attach(10);
+  servo.write(50);
+  lcd.init();
+  lcd.backlight();
+  lcd.setCursor(3, 0);
+  lcd.print("WELCOME TO");
+  lcd.setCursor(0, 1);
+  lcd.print("DOOR LOCK SYSTEM");
+  delay(3000);
+  lcd.clear();
+  
+  strcpy(currentPassword, defaultPassword);
+  password.set(currentPassword);
+}
+
+void loop() {
+  if (isLockedOut) {
+    handleLockout();
+    return;
+  }
+
+  char key = keypad.getKey();
+  
+  switch(systemState) {
+    case NORMAL: handleNormalMode(key); break;
+    case CHANGE_PASSWORD: handleChangePasswordMode(key); break;
+    case VERIFY_OLD: handleVerifyOldPassword(key); break;
+    case ENTER_NEW: handleEnterNewPassword(key); break;
+    case CONFIRM_NEW: handleConfirmNewPassword(key); break;
+  }
+}
+
+void handleLockout() {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("LOCKED OUT!");
+  lcd.setCursor(0, 1);
+  unsigned long elapsed = (millis() - lockoutStartTime) / 1000;
+  lcd.print("Wait ");
+  lcd.print((lockoutDuration / 1000) - elapsed);
+  lcd.print("s");
+
+  if (millis() - lockoutStartTime >= lockoutDuration) {
+    isLockedOut = false;
+    wrongAttemptCount = 0;
+    lcd.clear();
+    systemState = NORMAL;
+  }
+}
+
+void handleNormalMode(char key) {
+  lcd.setCursor(1, 0);
+  lcd.print("ENTER PASSWORD");
+
+  if (key == NO_KEY) return;
+  
+  delay(60);
+  
+  if (key == 'C') {
+    resetPassword();
+  } 
+  else if (key == 'D') {
+    doorToggle();
+  }
+  else if (key == '*') {
+    systemState = CHANGE_PASSWORD;
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("PASSWORD CHANGE");
+    lcd.setCursor(0, 1);
+    lcd.print("PRESS D TO START");
+  }
+  else {
+    processNumberKey(key);
+  }
+}
+
+void handleChangePasswordMode(char key) {
+  if (key == 'D') {
+    systemState = VERIFY_OLD;
+    password.reset();
+    currentPasswordLength = 0;
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("ENTER OLD PASS:");
+    lcd.setCursor(0, 1);
+  }
+  else if (key == '*') {
+    systemState = NORMAL;
+    lcd.clear();
+  }
+}
+
+void handleVerifyOldPassword(char key) {
+  if (key == 'D') {
+    if (currentPasswordLength > 0) {
+      if (password.evaluate()) {
+        wrongAttemptCount = 0;
+        systemState = ENTER_NEW;
+        password.reset();
+        currentPasswordLength = 0;
+        memset(newPassword, 0, sizeof(newPassword));
+        passwordEntryPosition = 0;
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("ENTER NEW PASS:");
+        lcd.setCursor(0, 1);
+      } else {
+        handleWrongPassword();
+      }
+    }
+    return;
+  }
+  
+  if (key == '*') {
+    systemState = NORMAL;
+    password.reset();
+    currentPasswordLength = 0;
+    lcd.clear();
+    return;
+  }
+
+  if (key != NO_KEY && currentPasswordLength < maxPasswordLength) {
+    lcd.setCursor(currentPasswordLength, 1);
+    lcd.print("*");
+    password.append(key);
+    currentPasswordLength++;
+  }
+}
+
+void handleEnterNewPassword(char key) {
+  if (key == 'D') {
+    if (passwordEntryPosition > 0) {
+      systemState = CONFIRM_NEW;
+      passwordEntryPosition = 0;
+      memset(confirmPassword, 0, sizeof(confirmPassword));
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("CONFIRM NEW PASS:");
+      lcd.setCursor(0, 1);
+    }
+    return;
+  }
+  
+  if (key == '*') {
+    systemState = NORMAL;
+    lcd.clear();
+    return;
+  }
+
+  if (key != NO_KEY && passwordEntryPosition < maxPasswordLength) {
+    newPassword[passwordEntryPosition] = key;
+    passwordEntryPosition++;
+    lcd.setCursor(passwordEntryPosition - 1, 1);
+    lcd.print("*");
+  }
+}
+
+void handleConfirmNewPassword(char key) {
+  if (key == 'D') {
+    if (strcmp(newPassword, confirmPassword) == 0) {
+      strcpy(currentPassword, newPassword);
+      password.set(currentPassword);
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("PASSWORD CHANGED!");
+      beepSuccess();
+      delay(2000);
+    } else {
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("PASSWORDS DON'T");
+      lcd.setCursor(0, 1);
+      lcd.print("MATCH! TRY AGAIN");
+      beepError();
+      delay(2000);
+      systemState = ENTER_NEW;
+      passwordEntryPosition = 0;
+      memset(newPassword, 0, sizeof(newPassword));
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("ENTER NEW PASS:");
+      lcd.setCursor(0, 1);
+    }
+    systemState = NORMAL;
+    return;
+  }
+  
+  if (key == '*') {
+    systemState = NORMAL;
+    lcd.clear();
+    return;
+  }
+
+  if (key != NO_KEY && passwordEntryPosition < maxPasswordLength) {
+    confirmPassword[passwordEntryPosition] = key;
+    passwordEntryPosition++;
+    lcd.setCursor(passwordEntryPosition - 1, 1);
+    lcd.print("*");
+  }
+}
+
+void processNumberKey(char key) {
+  if (key == 'D' || key == '*') return;
+  
+  lcd.setCursor(currentPasswordLength, 1);
+  lcd.print("*");
+  currentPasswordLength++;
+  password.append(key);
+
+  if (currentPasswordLength == maxPasswordLength) {
+    doorToggle();
+  }
+}
+
+void doorToggle() {
+  if (password.evaluate()) {
+    wrongAttemptCount = 0;
+    if (servo.read() == 50) {
+      dooropen();
+    } else {
+      doorlocked();
+    }
+  } else {
+    handleWrongPassword();
+  }
+  resetPassword();
+}
+
+void handleWrongPassword() {
+  wrongAttemptCount++;
+  if (wrongAttemptCount >= 3) {
+    isLockedOut = true;
+    lockoutStartTime = millis();
+  }
+  beepError();
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("WRONG PASSWORD!");
+  lcd.setCursor(0, 1);
+  lcd.print("PLEASE TRY AGAIN");
+  delay(2000);
+  lcd.clear();
+}
+
+void dooropen() {
+  digitalWrite(buzzer, HIGH);
+  delay(300);
+  digitalWrite(buzzer, LOW);
+  servo.write(50);
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("CORRECT PASSWORD");
+  lcd.setCursor(0, 1);
+  lcd.print("DOOR OPENED");
+  delay(2000);
+  lcd.clear();
+}
+
+void doorlocked() {
+  digitalWrite(buzzer, HIGH);
+  delay(300);
+  digitalWrite(buzzer, LOW);
+  servo.write(110);
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("CORRECT PASSWORD");
+  lcd.setCursor(2, 1);
+  lcd.print("DOOR LOCKED");
+  delay(2000);
+  lcd.clear();
+}
+
+void resetPassword() {
+  password.reset();
+  currentPasswordLength = 0;
+  lcd.clear();
+}
+
+void beepSuccess() {
+  digitalWrite(buzzer, HIGH);
+  delay(200);
+  digitalWrite(buzzer, LOW);
+  delay(100);
+  digitalWrite(buzzer, HIGH);
+  delay(200);
+  digitalWrite(buzzer, LOW);
+}
+
+void beepError() {
+  for (int i = 0; i < 3; i++) {
+    digitalWrite(buzzer, HIGH);
+    delay(200);
+    digitalWrite(buzzer, LOW);
+    delay(100);
+  }
+}
